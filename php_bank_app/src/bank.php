@@ -232,7 +232,7 @@ function gibdd_api_request(string $method, string $action, ?array $payload = nul
     $separator = str_contains($baseUrl, '?') ? '&' : '?';
     $url = $baseUrl . $separator . 'action=' . rawurlencode($action);
     $headers = "Authorization: Bearer " . $token . "\r\nAccept: application/json\r\n";
-    $options = ['method' => strtoupper($method), 'header' => $headers, 'timeout' => 8, 'ignore_errors' => true];
+    $options = ['method' => strtoupper($method), 'header' => $headers, 'timeout' => 5, 'ignore_errors' => true];
     if ($payload !== null) {
         $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         if ($json === false) throw new RuntimeException('Не удалось сформировать запрос к ГИБДД.');
