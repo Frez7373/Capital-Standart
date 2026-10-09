@@ -15,4 +15,7 @@ return [
         'pass' => getenv('DB_PASS') ?: '',
         'charset' => 'utf8mb4',
     ],
+    // AutoControl 200 API; keep the shared token secret.
+    'gibdd_api_url' => rtrim(getenv('GIBDD_API_URL') ?: 'http://127.0.0.1/capital_gibdd/api/capital_standard.php', '/'),
+    'gibdd_api_token' => getenv('GIBDD_API_TOKEN') ?: '',
 ];
