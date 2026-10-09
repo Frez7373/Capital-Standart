@@ -108,7 +108,7 @@ try {
     }
 } finally {
     // Retry callbacks that could not reach AutoControl 200 after an earlier payment.
-    try { $gibddCallbacks = notify_gibdd_callbacks(100); }
+    try { $gibddCallbacks = notify_gibdd_callbacks(10); }
     catch (Throwable $gibddCallbackError) {
         $failed++;
         error_log('Капитал-Стандарт: GIBDD callbacks failed: ' . $gibddCallbackError->getMessage());
