@@ -84,7 +84,16 @@ function pay_bill(int $billId, int $accountId, int $amountMinor, int $userId, ?i
         $desc = ($automatic ? 'Автооплата: ' : 'Оплата: ') . $bill['title'];
         $pdo->prepare('INSERT INTO transactions (reference, transaction_type, from_account_id, to_account_id, amount_minor, description, created_by, related_bill_id) VALUES (?, ?, ?, NULL, ?, ?, ?, ?)')
             ->execute([$ref, $type, $accountId, $pay, mb_substr($desc, 0, 255), $actorId ?? $userId, $billId]);
+        $fullyPaid = $remaining === 0;
+        if ($fullyPaid && bank_gibdd_link_table_exists()) {
+            $pdo->prepare("UPDATE external_bill_links SET payment_id=?, callback_status='pending', callback_last_error=NULL WHERE bank_bill_id=? AND callback_status <> 'sent'")
+                ->execute([$ref, $billId]);
+        }
         $pdo->commit();
+        if ($fullyPaid) {
+            try { notify_gibdd_callbacks(1); }
+            catch (Throwable $callbackError) { error_log('Капитал-Стандарт: ГИБДД callback failed: ' . $callbackError->getMessage()); }
+        }
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         throw $e;
@@ -189,4 +198,152 @@ function process_savings_interest(DateTimeImmutable $now): int
         }
     }
     return $processed;
+}
+
+/** Return true when the external payment mapping migration is installed. */
+function bank_gibdd_link_table_exists(): bool
+{
+    static $exists = null;
+    if ($exists !== null) return $exists;
+    try {
+        $stmt = db()->prepare("SELECT 1 FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='external_bill_links' LIMIT 1");
+        $stmt->execute();
+        $exists = (bool)$stmt->fetchColumn();
+    } catch (Throwable) {
+        $exists = false;
+    }
+    return $exists;
+}
+
+function gibdd_integration_enabled(): bool
+{
+    global $config;
+    return trim((string)($config['gibdd_api_url'] ?? '')) !== ''
+        && trim((string)($config['gibdd_api_token'] ?? '')) !== '';
+}
+
+/** Authenticated request to AutoControl 200. */
+function gibdd_api_request(string $method, string $action, ?array $payload = null): array
+{
+    global $config;
+    $baseUrl = trim((string)($config['gibdd_api_url'] ?? ''));
+    $token = trim((string)($config['gibdd_api_token'] ?? ''));
+    if ($baseUrl === '' || $token === '') throw new RuntimeException('Не настроены GIBDD_API_URL и GIBDD_API_TOKEN.');
+    $separator = str_contains($baseUrl, '?') ? '&' : '?';
+    $url = $baseUrl . $separator . 'action=' . rawurlencode($action);
+    $headers = "Authorization: Bearer " . $token . "\r\nAccept: application/json\r\n";
+    $options = ['method' => strtoupper($method), 'header' => $headers, 'timeout' => 5, 'ignore_errors' => true];
+    if ($payload !== null) {
+        $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($json === false) throw new RuntimeException('Не удалось сформировать запрос к ГИБДД.');
+        $options['header'] .= "Content-Type: application/json\r\n";
+        $options['content'] = $json;
+    }
+    $context = stream_context_create(['http' => $options]);
+    $raw = @file_get_contents($url, false, $context);
+    $status = 0;
+    foreach (($http_response_header ?? []) as $headerLine) {
+        if (preg_match('/^HTTP\/\S+\s+(\d{3})/', $headerLine, $m)) $status = (int)$m[1];
+    }
+    if ($raw === false) throw new RuntimeException('API ГИБДД недоступен по адресу ' . $baseUrl . '.');
+    $decoded = json_decode($raw, true);
+    if (!is_array($decoded)) throw new RuntimeException('API ГИБДД вернул некорректный JSON.');
+    if ($status < 200 || $status >= 300 || empty($decoded['ok'])) {
+        throw new RuntimeException('API ГИБДД: ' . mb_substr((string)($decoded['message'] ?? ('HTTP ' . $status)), 0, 220));
+    }
+    return $decoded;
+}
+
+/** Convert RUB decimal to integer kopecks without floating-point arithmetic. */
+function gibdd_money_to_minor(mixed $value): int
+{
+    $raw = trim(str_replace([' ', ','], ['', '.'], (string)$value));
+    if (!preg_match('/^(\d{1,12})(?:\.(\d{1,2}))?$/', $raw, $m)) throw new RuntimeException('В начислении ГИБДД указана некорректная сумма.');
+    $minor = ((int)$m[1] * 100) + (int)str_pad((string)($m[2] ?? ''), 2, '0');
+    if ($minor <= 0 || $minor > 9000000000000000) throw new RuntimeException('Сумма штрафа вне допустимого диапазона.');
+    return $minor;
+}
+
+/**
+ * Pull fines from AutoControl 200 and create matching bank bills.
+ * The GIBDD owner's bank_customer_id must be the numeric users.id in this bank.
+ */
+function sync_gibdd_fines(): array
+{
+    if (!gibdd_integration_enabled()) return ['enabled'=>false,'created'=>0,'skipped'=>0,'errors'=>0];
+    if (!bank_gibdd_link_table_exists()) throw new RuntimeException('Не установлена миграция database/migrations/20261009_gibdd_fine_integration.sql.');
+    $response = gibdd_api_request('GET', 'pending');
+    $created = 0; $skipped = 0; $errors = 0;
+    foreach (($response['bills'] ?? []) as $fine) {
+        $externalNumber = trim((string)($fine['bill_number'] ?? ''));
+        try {
+            if ($externalNumber === '' || strlen($externalNumber) > 50) throw new RuntimeException('Пустой или некорректный номер начисления.');
+            $existing = db()->prepare("SELECT id FROM external_bill_links WHERE provider='autocontrol200' AND external_bill_number=? LIMIT 1");
+            $existing->execute([$externalNumber]);
+            if ($existing->fetchColumn()) { $skipped++; continue; }
+            $customerRaw = trim((string)($fine['customer_id'] ?? ''));
+            if (!preg_match('/^\d{1,20}$/', $customerRaw) || (int)$customerRaw < 1) throw new RuntimeException('В профиле владельца ГИБДД не указан числовой ID клиента банка.');
+            $bankUserId = (int)$customerRaw;
+            $customer = db()->prepare("SELECT id FROM users WHERE id=? AND role='customer' AND status='active' LIMIT 1");
+            $customer->execute([$bankUserId]);
+            if (!$customer->fetchColumn()) throw new RuntimeException('Клиент банка #' . $bankUserId . ' не найден или заблокирован.');
+            $amountMinor = gibdd_money_to_minor($fine['amount'] ?? '');
+            $fineNumber = trim((string)($fine['fine_number'] ?? ''));
+            $plate = trim((string)($fine['plate'] ?? ''));
+            $title = mb_substr('Штраф ГИБДД ' . $fineNumber . ' · ' . $plate, 0, 160);
+            $dueDate = (string)($fine['due_date'] ?? '');
+            if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $dueDate) || !checkdate((int)substr($dueDate,5,2),(int)substr($dueDate,8,2),(int)substr($dueDate,0,4))) $dueDate = null;
+            $note = mb_substr(implode(' · ', array_filter([
+                'Постановление ' . $fineNumber,
+                'Автомобиль: ' . $plate . ' ' . trim((string)($fine['make'] ?? '') . ' ' . (string)($fine['model'] ?? '')),
+                'Статья: ' . trim((string)($fine['article'] ?? '')),
+                'Описание: ' . trim((string)($fine['description'] ?? '')),
+                'Взыскатель: ' . trim((string)($fine['creditor'] ?? 'АвтоКонтроль 200 / ГИБДД')),
+                'Начисление: ' . $externalNumber,
+            ], static fn($part) => trim($part) !== '')), 0, 500);
+            $pdo = db();
+            $pdo->beginTransaction();
+            try {
+                $check = $pdo->prepare("SELECT id FROM external_bill_links WHERE provider='autocontrol200' AND external_bill_number=? FOR UPDATE");
+                $check->execute([$externalNumber]);
+                if ($check->fetchColumn()) { $pdo->commit(); $skipped++; continue; }
+                $pdo->prepare("INSERT INTO bills (user_id,title,bill_type,amount_minor,remaining_minor,due_date,status,note,created_by) VALUES (?,?,'fine',?,?,?,'unpaid',?,NULL)")
+                    ->execute([$bankUserId,$title,$amountMinor,$amountMinor,$dueDate,$note]);
+                $bankBillId = (int)$pdo->lastInsertId();
+                $pdo->prepare("INSERT INTO external_bill_links (provider,external_bill_number,external_fine_number,bank_bill_id,bank_user_id,vehicle_plate) VALUES ('autocontrol200',?,?,?,?,?)")
+                    ->execute([$externalNumber,$fineNumber,$bankBillId,$bankUserId,$plate]);
+                $pdo->commit();
+                audit('gibdd_fine_received', 'Получено начисление ГИБДД ' . $externalNumber . ' для клиента #' . $bankUserId, null);
+                $created++;
+            } catch (Throwable $inner) {
+                if ($pdo->inTransaction()) $pdo->rollBack();
+                throw $inner;
+            }
+        } catch (Throwable $e) {
+            $errors++;
+            error_log('Капитал-Стандарт: импорт штрафа ГИБДД ' . $externalNumber . ' не выполнен: ' . $e->getMessage());
+        }
+    }
+    return ['enabled'=>true,'created'=>$created,'skipped'=>$skipped,'errors'=>$errors];
+}
+
+/** Send payment receipts to GIBDD. Failed callbacks remain queued for cron retry. */
+function notify_gibdd_callbacks(int $limit = 50): int
+{
+    if (!gibdd_integration_enabled() || !bank_gibdd_link_table_exists()) return 0;
+    $limit = max(1, min(200, $limit));
+    $links = db()->query("SELECT id,external_bill_number,payment_id FROM external_bill_links WHERE callback_status IN ('pending','failed') AND payment_id IS NOT NULL ORDER BY id ASC LIMIT " . $limit)->fetchAll();
+    $sent = 0;
+    foreach ($links as $link) {
+        $linkId = (int)$link['id'];
+        try {
+            gibdd_api_request('POST', 'mark_paid', ['action'=>'mark_paid','bill_number'=>(string)$link['external_bill_number'],'payment_id'=>(string)$link['payment_id']]);
+            db()->prepare("UPDATE external_bill_links SET callback_status='sent',callback_attempts=callback_attempts+1,callback_last_error=NULL,callback_sent_at=NOW() WHERE id=?")->execute([$linkId]);
+            $sent++;
+        } catch (Throwable $e) {
+            db()->prepare("UPDATE external_bill_links SET callback_status='failed',callback_attempts=callback_attempts+1,callback_last_error=? WHERE id=?")->execute([mb_substr($e->getMessage(),0,500),$linkId]);
+            error_log('Капитал-Стандарт: подтверждение оплаты ГИБДД для связи #' . $linkId . ' отложено: ' . $e->getMessage());
+        }
+    }
+    return $sent;
 }
