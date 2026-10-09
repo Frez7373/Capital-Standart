@@ -12,6 +12,8 @@ $done = 0;
 $failed = 0;
 $now = new DateTimeImmutable('now');
 $interestAccounts = 0;
+$gibddCreated = 0;
+$gibddCallbacks = 0;
 
 try {
     try {
@@ -21,6 +23,16 @@ try {
         $failed++;
         error_log('Капитал-Стандарт: interest processing unavailable: ' . $interestError->getMessage());
     }
+    // Import GIBDD fines before recurring bill auto-pay rules run.
+    try {
+        $gibddSync = sync_gibdd_fines();
+        $gibddCreated = (int)($gibddSync['created'] ?? 0);
+        if (!empty($gibddSync['errors'])) $failed += (int)$gibddSync['errors'];
+    } catch (Throwable $gibddError) {
+        $failed++;
+        error_log('Капитал-Стандарт: GIBDD fine sync failed: ' . $gibddError->getMessage());
+    }
+
     // Customer recurring transfers and bill auto-pay rules.
     $rules = $pdo->prepare("SELECT * FROM recurring_rules WHERE status='active' AND next_run_at <= ? ORDER BY next_run_at ASC LIMIT 100");
     $rules->execute([$now->format('Y-m-d H:i:s')]);
@@ -95,7 +107,13 @@ try {
         }
     }
 } finally {
+    // Retry callbacks that could not reach AutoControl 200 after an earlier payment.
+    try { $gibddCallbacks = notify_gibdd_callbacks(100); }
+    catch (Throwable $gibddCallbackError) {
+        $failed++;
+        error_log('Капитал-Стандарт: GIBDD callbacks failed: ' . $gibddCallbackError->getMessage());
+    }
     $pdo->query("SELECT RELEASE_LOCK('cci_bank_scheduler')");
 }
 
-fwrite(STDOUT, sprintf("Планировщик «Капитал-Стандарт» завершён. Processed: %d; failed: %d; savings interest accounts: %d; at %s\n", $done, $failed, $interestAccounts, $now->format('Y-m-d H:i:s')));
+fwrite(STDOUT, sprintf("Планировщик «Капитал-Стандарт» завершён. Processed: %d; failed: %d; savings interest accounts: %d; GIBDD fines imported: %d; GIBDD payments confirmed: %d; at %s\n", $done, $failed, $interestAccounts, $gibddCreated, $gibddCallbacks, $now->format('Y-m-d H:i:s')));
