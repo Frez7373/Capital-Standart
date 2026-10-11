@@ -281,7 +281,7 @@ function sync_gibdd_fines(): array
             $existing = db()->prepare("SELECT id FROM external_bill_links WHERE provider='autocontrol200' AND external_bill_number=? LIMIT 1");
             $existing->execute([$externalNumber]);
             if ($existing->fetchColumn()) { $skipped++; continue; }
-            $customerRaw = trim((string)($fine['customer_id'] ?? ''));
+            $customerRaw = trim((string)($fine['bank_customer_id'] ?? $fine['customer_id'] ?? ''));
             if (!preg_match('/^\d{1,20}$/', $customerRaw) || (int)$customerRaw < 1) throw new RuntimeException('В профиле владельца ГИБДД не указан числовой ID клиента банка.');
             $bankUserId = (int)$customerRaw;
             $customer = db()->prepare("SELECT id FROM users WHERE id=? AND role='customer' AND status='active' LIMIT 1");
