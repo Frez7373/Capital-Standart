@@ -1,0 +1,19 @@
+name: PHP syntax check
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, 'feature/**']
+
+jobs:
+  php-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+      - name: Check PHP syntax
+        run: find php_bank_app -type f -name '*.php' -print0 | xargs -0 -n1 php -l
