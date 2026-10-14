@@ -148,6 +148,33 @@ try {
         $amountRaw = $input['amount'] ?? '';
         if (!is_string($amountRaw) && !is_int($amountRaw) && !is_float($amountRaw)) throw new InvalidArgumentException('Некорректная сумма сделки.');
         $amountMinor = money_to_minor((string)$amountRaw);
+        $idempotencyKey = 'gibdd-car:' . $external;
+        $pdo = db();
+        // Resolve completed payments before checking current account status: a retry must confirm a prior transfer even if an account was later blocked.
+        $stmt = $pdo->prepare('SELECT t.id,t.reference,t.transaction_type,t.amount_minor,
+                                      fa.account_number AS from_number,fu.email AS from_email,
+                                      ta.account_number AS to_number,tu.email AS to_email
+                               FROM transactions t
+                               JOIN accounts fa ON fa.id=t.from_account_id
+                               JOIN users fu ON fu.id=fa.user_id
+                               JOIN accounts ta ON ta.id=t.to_account_id
+                               JOIN users tu ON tu.id=ta.user_id
+                               WHERE t.idempotency_key=? LIMIT 1');
+        $stmt->execute([$idempotencyKey]);
+        $prior = $stmt->fetch();
+        if ($prior) {
+            $sameTransfer = $prior['transaction_type'] === 'transfer'
+                && strcasecmp((string)$prior['from_number'], $sourceNumber) === 0
+                && strcasecmp((string)$prior['to_number'], $destinationNumber) === 0
+                && strcasecmp((string)$prior['from_email'], $buyerEmail) === 0
+                && strcasecmp((string)$prior['to_email'], $sellerEmail) === 0
+                && (int)$prior['amount_minor'] === $amountMinor;
+            if (!$sameTransfer) {
+                partner_json(409, ['success'=>false,'error'=>'idempotency_conflict','message'=>'Номер сделки уже использован для другого перевода.']);
+            }
+            partner_json(200, ['success'=>true,'duplicate'=>true,'transaction_reference'=>(string)$prior['reference'],'message'=>'Перевод этой сделки уже выполнен.']);
+        }
+
         $buyer = partner_customer($buyerEmail);
         $seller = partner_customer($sellerEmail);
         $from = partner_find_account($sourceNumber);
@@ -157,21 +184,6 @@ try {
         }
         if ((int)$to['owner_id'] !== (int)$seller['id'] || strcasecmp((string)$to['owner_email'], $sellerEmail) !== 0) {
             throw new RuntimeException('Счёт получения не принадлежит продавцу.');
-        }
-        $idempotencyKey = 'gibdd-car:' . $external;
-        $pdo = db();
-        $stmt = $pdo->prepare('SELECT id,reference,transaction_type,from_account_id,to_account_id,amount_minor
-                               FROM transactions WHERE idempotency_key=? LIMIT 1');
-        $stmt->execute([$idempotencyKey]);
-        $prior = $stmt->fetch();
-        if ($prior) {
-            if ($prior['transaction_type'] !== 'transfer'
-                || (int)$prior['from_account_id'] !== (int)$from['id']
-                || (int)$prior['to_account_id'] !== (int)$to['id']
-                || (int)$prior['amount_minor'] !== $amountMinor) {
-                partner_json(409, ['success'=>false,'error'=>'idempotency_conflict','message'=>'Номер сделки уже использован для другого перевода.']);
-            }
-            partner_json(200, ['success'=>true,'duplicate'=>true,'transaction_reference'=>(string)$prior['reference'],'message'=>'Перевод этой сделки уже выполнен.']);
         }
         try {
             $txId = post_money_transaction('transfer', (int)$from['id'], (int)$to['id'], $amountMinor,
