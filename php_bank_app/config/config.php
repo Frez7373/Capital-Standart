@@ -9,6 +9,8 @@ return [
     'timezone' => getenv('APP_TIMEZONE') ?: 'Europe/Stockholm',
     'gibdd_api_url' => rtrim(getenv('GIBDD_API_URL') ?: '', '/'),
     'gibdd_api_token' => getenv('GIBDD_API_TOKEN') ?: '',
+    // Shared secret for authenticated server-to-server requests from АвтоКонтроль.
+    'partner_api_key' => getenv('BANK_PARTNER_API_KEY') ?: '',
     'db' => [
         'host' => getenv('DB_HOST') ?: '127.0.0.1',
         'port' => getenv('DB_PORT') ?: '3306',
