@@ -190,9 +190,18 @@ try {
             }
             throw $e;
         }
-        $stmt = $pdo->prepare('SELECT reference FROM transactions WHERE id=?');
-        $stmt->execute([$txId]);
+        // A committed transfer must still be reported as successful if a later audit/read operation encounters a transient error.
+        $stmt = $pdo->prepare('SELECT reference FROM transactions WHERE id=? AND idempotency_key=?');
+        $stmt->execute([$txId, $idempotencyKey]);
         $reference = (string)$stmt->fetchColumn();
+        if ($reference === '') {
+            $stmt = $pdo->prepare('SELECT reference FROM transactions WHERE idempotency_key=? AND transaction_type=? AND from_account_id=? AND to_account_id=? AND amount_minor=? LIMIT 1');
+            $stmt->execute([$idempotencyKey, 'transfer', (int)$from['id'], (int)$to['id'], $amountMinor]);
+            $reference = (string)$stmt->fetchColumn();
+        }
+        if ($reference === '') {
+            partner_json(503, ['success'=>false,'error'=>'transfer_result_uncertain','message'=>'Банк временно не может подтвердить результат. Повторите запрос с тем же номером сделки.']);
+        }
         audit('vehicle_purchase_transfer', 'Перевод по сделке ' . $external . ' на сумму ' . $amountMinor . ' minor units', (int)$buyer['id']);
         partner_json(200, ['success'=>true,'transaction_reference'=>$reference,'message'=>'Оплата автомобиля выполнена.']);
     }
